@@ -101,42 +101,81 @@ var (
 // portsByPodName is a map that maps pod name to container ports.
 type portsByPodName map[string][]int
 
+// affinityCheckFromPod returns interval, timeout and function pinging the service and
+// returning pinged hosts for pinging the service from execPod.
+func affinityCheckFromPod(execPod *v1.Pod, serviceIP string, servicePort int) (time.Duration, time.Duration, func() []string) {
+	timeout := AffinityTimeout
+	// interval considering a maximum of 2 seconds per connection
+	interval := 2 * AffinityConfirmCount * time.Second
+
+	serviceIPPort := net.JoinHostPort(serviceIP, strconv.Itoa(servicePort))
+	curl := fmt.Sprintf(`curl -q -s --connect-timeout 2 http://%s/`, serviceIPPort)
+	cmd := fmt.Sprintf("for i in $(seq 0 %d); do echo; %s ; done", AffinityConfirmCount, curl)
+	getHosts := func() []string {
+		stdout, err := framework.RunHostCmd(execPod.Namespace, execPod.Name, cmd)
+		if err != nil {
+			framework.Logf("Failed to get response from %s. Retry until timeout", serviceIPPort)
+			return nil
+		}
+		return strings.Split(stdout, "\n")
+	}
+
+	return interval, timeout, getHosts
+}
+
+// affinityCheckFromTest returns interval, timeout and function pinging the service and
+// returning pinged hosts for pinging the service from the test itself.
+func affinityCheckFromTest(cs clientset.Interface, serviceIP string, servicePort int) (time.Duration, time.Duration, func() []string) {
+	interval := 2 * time.Second
+	timeout := e2eservice.GetServiceLoadBalancerPropagationTimeout(cs)
+
+	params := &e2enetwork.HTTPPokeParams{Timeout: 2 * time.Second}
+	getHosts := func() []string {
+		var hosts []string
+		for i := 0; i < AffinityConfirmCount; i++ {
+			result := e2enetwork.PokeHTTP(serviceIP, servicePort, "", params)
+			if result.Status == e2enetwork.HTTPSuccess {
+				hosts = append(hosts, string(result.Body))
+			}
+		}
+		return hosts
+	}
+
+	return interval, timeout, getHosts
+}
+
 // CheckAffinity function tests whether the service affinity works as expected.
 // If affinity is expected, the test will return true once affinityConfirmCount
 // number of same response observed in a row. If affinity is not expected, the
 // test will keep observe until different responses observed. The function will
 // return false only in case of unexpected errors.
 func checkAffinity(cs clientset.Interface, execPod *v1.Pod, serviceIP string, servicePort int, shouldHold bool) bool {
-	serviceIPPort := net.JoinHostPort(serviceIP, strconv.Itoa(servicePort))
-	curl := fmt.Sprintf(`curl -q -s --connect-timeout 2 http://%s/`, serviceIPPort)
-	cmd := fmt.Sprintf("for i in $(seq 0 %d); do echo; %s ; done", AffinityConfirmCount, curl)
-	timeout := AffinityTimeout
-	if execPod == nil {
-		timeout = e2eservice.GetServiceLoadBalancerPropagationTimeout(cs)
+	var interval, timeout time.Duration
+	var getHosts func() []string
+	if execPod != nil {
+		interval, timeout, getHosts = affinityCheckFromPod(execPod, serviceIP, servicePort)
+	} else {
+		interval, timeout, getHosts = affinityCheckFromTest(cs, serviceIP, servicePort)
 	}
+
 	var tracker affinityTracker
-	// interval considering a maximum of 2 seconds per connection
-	interval := 2 * AffinityConfirmCount * time.Second
 	if pollErr := wait.PollImmediate(interval, timeout, func() (bool, error) {
-		if execPod != nil {
-			stdout, err := framework.RunHostCmd(execPod.Namespace, execPod.Name, cmd)
-			if err != nil {
-				framework.Logf("Failed to get response from %s. Retry until timeout", serviceIPPort)
-				return false, nil
-			}
-			hosts := strings.Split(stdout, "\n")
-			for _, host := range hosts {
+		hosts := getHosts()
+		for _, host := range hosts {
+			if len(host) > 0 {
 				tracker.recordHost(strings.TrimSpace(host))
 			}
-		} else {
-			rawResponse := GetHTTPContent(serviceIP, servicePort, timeout, "")
-			tracker.recordHost(rawResponse.String())
 		}
+
 		trackerFulfilled, affinityHolds := tracker.checkHostTrace(AffinityConfirmCount)
+		if !trackerFulfilled {
+			return false, nil
+		}
+
 		if !shouldHold && !affinityHolds {
 			return true, nil
 		}
-		if shouldHold && trackerFulfilled && affinityHolds {
+		if shouldHold && affinityHolds {
 			return true, nil
 		}
 		return false, nil
@@ -147,7 +186,7 @@ func checkAffinity(cs clientset.Interface, execPod *v1.Pod, serviceIP string, se
 			return false
 		}
 		if !trackerFulfilled {
-			checkAffinityFailed(tracker, fmt.Sprintf("Connection to %s timed out or not enough responses.", serviceIPPort))
+			checkAffinityFailed(tracker, fmt.Sprintf("Connection timed out or not enough responses."))
 		}
 		if shouldHold {
 			checkAffinityFailed(tracker, "Affinity should hold but didn't.")
@@ -3569,40 +3608,42 @@ func translatePodNameToUID(c clientset.Interface, ns string, expectedEndpoints p
 // validateEndpointsPorts validates that the given service exists and is served by the given expectedEndpoints.
 func validateEndpointsPorts(c clientset.Interface, namespace, serviceName string, expectedEndpoints portsByPodName) error {
 	ginkgo.By(fmt.Sprintf("waiting up to %v for service %s in namespace %s to expose endpoints %v", framework.ServiceStartTimeout, serviceName, namespace, expectedEndpoints))
-	i := 1
-	for start := time.Now(); time.Since(start) < framework.ServiceStartTimeout; time.Sleep(1 * time.Second) {
+	expectedPortsByPodUID, err := translatePodNameToUID(c, namespace, expectedEndpoints)
+	if err != nil {
+		return err
+	}
+
+	i := 0
+	if pollErr := wait.PollImmediate(time.Second, framework.ServiceStartTimeout, func() (bool, error) {
 		ep, err := c.CoreV1().Endpoints(namespace).Get(context.TODO(), serviceName, metav1.GetOptions{})
 		if err != nil {
-			framework.Logf("Get endpoints failed (%v elapsed, ignoring for 5s): %v", time.Since(start), err)
-			continue
+			framework.Logf("Failed go get Endpoints object: %v", err)
+			// Retry the error
+			return false, nil
 		}
 		portsByPodUID := e2eendpoints.GetContainerPortsByPodUID(ep)
-		expectedPortsByPodUID, err := translatePodNameToUID(c, namespace, expectedEndpoints)
-		if err != nil {
-			return err
-		}
-		if len(portsByPodUID) == len(expectedEndpoints) {
-			err := validatePorts(portsByPodUID, expectedPortsByPodUID)
-			if err != nil {
-				return err
-			}
-			framework.Logf("successfully validated that service %s in namespace %s exposes endpoints %v (%v elapsed)",
-				serviceName, namespace, expectedEndpoints, time.Since(start))
-			return nil
-		}
-		if i%5 == 0 {
-			framework.Logf("Unexpected endpoints: found %v, expected %v (%v elapsed, will retry)", portsByPodUID, expectedEndpoints, time.Since(start))
-		}
+
 		i++
-	}
-	if pods, err := c.CoreV1().Pods(metav1.NamespaceAll).List(context.TODO(), metav1.ListOptions{}); err == nil {
-		for _, pod := range pods.Items {
-			framework.Logf("Pod %s\t%s\t%s\t%s", pod.Namespace, pod.Name, pod.Spec.NodeName, pod.DeletionTimestamp)
+		if err := validatePorts(portsByPodUID, expectedPortsByPodUID); err != nil {
+			if i%5 == 0 {
+				framework.Logf("Unexpected endpoints: found %v, expected %v, will retry", portsByPodUID, expectedEndpoints)
+			}
+			return false, nil
 		}
-	} else {
-		framework.Logf("Can't list pod debug info: %v", err)
+		framework.Logf("successfully validated that service %s in namespace %s exposes endpoints %v",
+			serviceName, namespace, expectedEndpoints)
+		return true, nil
+	}); pollErr != nil {
+		if pods, err := c.CoreV1().Pods(metav1.NamespaceAll).List(context.TODO(), metav1.ListOptions{}); err == nil {
+			for _, pod := range pods.Items {
+				framework.Logf("Pod %s\t%s\t%s\t%s", pod.Namespace, pod.Name, pod.Spec.NodeName, pod.DeletionTimestamp)
+			}
+		} else {
+			framework.Logf("Can't list pod debug info: %v", err)
+		}
+		return fmt.Errorf("error waithing for service %s in namespace %s to expose endpoints %v: %v", serviceName, namespace, expectedEndpoints, pollErr)
 	}
-	return fmt.Errorf("Timed out waiting for service %s in namespace %s to expose endpoints %v (%v elapsed)", serviceName, namespace, expectedEndpoints, framework.ServiceStartTimeout)
+	return nil
 }
 
 // restartApiserver restarts the kube-apiserver.

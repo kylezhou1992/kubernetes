@@ -32,6 +32,7 @@ import (
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/defaultbinder"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/queuesort"
+	"k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
 	internalcache "k8s.io/kubernetes/pkg/scheduler/internal/cache"
 	internalqueue "k8s.io/kubernetes/pkg/scheduler/internal/queue"
@@ -259,7 +260,7 @@ func TestGenericSchedulerWithExtenders(t *testing.T) {
 			client := clientsetfake.NewSimpleClientset()
 			informerFactory := informers.NewSharedInformerFactory(client, 0)
 
-			extenders := []framework.Extender{}
+			var extenders []framework.Extender
 			for ii := range test.extenders {
 				extenders = append(extenders, &test.extenders[ii])
 			}
@@ -267,9 +268,12 @@ func TestGenericSchedulerWithExtenders(t *testing.T) {
 			for _, name := range test.nodes {
 				cache.AddNode(createNode(name))
 			}
-			queue := internalqueue.NewSchedulingQueue(nil)
 
-			fwk, err := st.NewFramework(test.registerPlugins, framework.WithClientSet(client))
+			fwk, err := st.NewFramework(
+				test.registerPlugins,
+				runtime.WithClientSet(client),
+				runtime.WithPodNominator(internalqueue.NewPodNominator()),
+			)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -279,7 +283,6 @@ func TestGenericSchedulerWithExtenders(t *testing.T) {
 
 			scheduler := NewGenericScheduler(
 				cache,
-				queue,
 				emptySnapshot,
 				extenders,
 				informerFactory.Core().V1().PersistentVolumeClaims().Lister(),

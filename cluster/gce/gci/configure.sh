@@ -379,7 +379,7 @@ function try-load-docker-image {
 
   if [[ "${CONTAINER_RUNTIME_NAME:-}" == "docker" ]]; then
     load_image_command=${LOAD_IMAGE_COMMAND:-docker load -i}
-  elif [[ "${CONTAINER_RUNTIME_NAME:-}" == "containerd" ]]; then
+  elif [[ "${CONTAINER_RUNTIME_NAME:-}" == "containerd" || "${CONTAINERD_TEST:-}"  == "containerd" ]]; then
     load_image_command=${LOAD_IMAGE_COMMAND:-ctr -n=k8s.io images import}
   else
     load_image_command="${LOAD_IMAGE_COMMAND:-}"
@@ -432,12 +432,7 @@ function install-docker {
     software-properties-common \
     lsb-release
 
-  # focal repo for docker is not yet available, so we use bonic for now
-  # https://github.com/kubernetes/kubernetes/issues/90709
   release=$(lsb_release -cs)
-  if [ "$release" == "focal" ]; then
-    release="bionic";
-  fi
 
   # Add the Docker apt-repository
   curl -fsSL https://download.docker.com/linux/$(. /etc/os-release; echo "$ID")/gpg \
@@ -478,12 +473,7 @@ function install-containerd-ubuntu {
     software-properties-common \
     lsb-release
 
-  # focal repo for docker is not yet available, so we use bonic for now
-  # https://github.com/kubernetes/kubernetes/issues/90709
   release=$(lsb_release -cs)
-  if [ "$release" == "focal" ]; then
-    release="bionic";
-  fi
 
   # Add the Docker apt-repository (as we install containerd from there)
   curl -fsSL https://download.docker.com/linux/$(. /etc/os-release; echo "$ID")/gpg \
@@ -500,7 +490,10 @@ function install-containerd-ubuntu {
   # Override to latest versions of containerd and runc
   systemctl stop containerd
   if [[ ! -z "${UBUNTU_INSTALL_CONTAINERD_VERSION:-}" ]]; then
-    curl -fsSL "https://github.com/containerd/containerd/releases/download/${UBUNTU_INSTALL_CONTAINERD_VERSION}/containerd-${UBUNTU_INSTALL_CONTAINERD_VERSION:1}.linux-amd64.tar.gz" | tar --overwrite -xzv -C /usr/
+    # containerd versions have slightly different url(s), so try both
+    ( curl -fsSL "https://github.com/containerd/containerd/releases/download/${UBUNTU_INSTALL_CONTAINERD_VERSION}/containerd-${UBUNTU_INSTALL_CONTAINERD_VERSION:1}-linux-amd64.tar.gz" || \
+      curl -fsSL "https://github.com/containerd/containerd/releases/download/${UBUNTU_INSTALL_CONTAINERD_VERSION}/containerd-${UBUNTU_INSTALL_CONTAINERD_VERSION:1}.linux-amd64.tar.gz" ) \
+    | tar --overwrite -xzv -C /usr/
   fi
   if [[ ! -z "${UBUNTU_INSTALL_RUNC_VERSION:-}" ]]; then
     curl -fsSL "https://github.com/opencontainers/runc/releases/download/${UBUNTU_INSTALL_RUNC_VERSION}/runc.amd64" --output /usr/sbin/runc && chmod 755 /usr/sbin/runc
